@@ -20,7 +20,7 @@ use anyhow::Result;
 use openvtc::openpgp_card::{factory_reset, get_cards};
 use openvtc::{
     LF_PUBLIC_MEDIATOR_DID,
-    config::{Config, did::create_initial_webvh_did},
+    config::{Config, UnlockCode, did::create_initial_webvh_did, public_config::PublicConfig},
 };
 use pgp::composed::ArmorOptions;
 use secrecy::SecretString;
@@ -36,9 +36,18 @@ pub mod messaging;
 pub mod setup_sequence;
 pub mod state;
 
+pub struct DeferredLoad {
+    pub profile: String,
+    pub public_config: PublicConfig,
+    pub unlock_passphrase: Option<UnlockCode>,
+    #[cfg(feature = "openpgp-card")]
+    pub user_pin: SecretString,
+}
+
 pub enum StartingMode {
     NotSet,
     MainPage(Box<Config>, TDK),
+    MainPageDeferred(DeferredLoad),
     SetupWizard,
 }
 
@@ -68,14 +77,16 @@ impl StateHandler {
     }
 
     pub async fn main_loop(
-        self,
+        mut self,
         mut terminator: Terminator,
         mut action_rx: UnboundedReceiver<Action>,
         mut interrupt_rx: broadcast::Receiver<Interrupted>,
     ) -> Result<Interrupted> {
         let mut state = State::default();
 
-        let (tdk, config) = match self.starting_mode {
+        let starting_mode =
+            std::mem::replace(&mut self.starting_mode, StartingMode::NotSet);
+        let (tdk, config) = match starting_mode {
             StartingMode::MainPage(config, tdk) => {
                 state.active_page = ActivePage::Main;
                 state.main_page.menu_panel.selected = true;
@@ -113,6 +124,129 @@ impl StateHandler {
                     }
                 }
             }
+            StartingMode::MainPageDeferred(deferred) => {
+                // Set minimal state from PublicConfig so UI can render immediately
+                state.active_page = ActivePage::Main;
+                state.main_page.menu_panel.selected = true;
+                state.main_page.config = main_page::MainMenuConfigState {
+                    name: deferred.public_config.friendly_name.clone(),
+                    did: deferred.public_config.persona_did.clone(),
+                };
+                state.connection.status =
+                    state::MediatorStatus::Initializing("Starting...".into());
+                self.state_tx.send(state.clone())?;
+
+                // Spawn TDK init + config load as a background task with progress reporting
+                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+
+                let mut load_handle = tokio::spawn(async move {
+                    let on_progress = |msg: &str| {
+                        let _ = progress_tx.send(msg.to_string());
+                    };
+
+                    on_progress("Starting TDK...");
+                    let mut tdk = TDK::new(
+                        TDKConfig::builder().with_load_environment(false).build()
+                            .map_err(|e| anyhow::anyhow!("TDK config failed: {e}"))?,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TDK init failed: {e}"))?;
+
+                    // TokenInteractions impl for openpgp-card
+                    #[cfg(feature = "openpgp-card")]
+                    let token_notifier = {
+                        use openvtc::config::TokenInteractions;
+
+                        struct TokenNotifier;
+                        impl TokenInteractions for TokenNotifier {
+                            fn touch_notify(&self) {}
+                            fn touch_completed(&self) {}
+                        }
+                        TokenNotifier
+                    };
+
+                    let config = Config::load_step2(
+                        &mut tdk,
+                        &deferred.profile,
+                        deferred.public_config,
+                        deferred.unlock_passphrase.as_ref(),
+                        #[cfg(feature = "openpgp-card")]
+                        &deferred.user_pin,
+                        #[cfg(feature = "openpgp-card")]
+                        &token_notifier,
+                        Some(&on_progress),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                    Ok::<_, anyhow::Error>((tdk, config))
+                });
+
+                // Listen for progress updates + handle user actions while loading
+                let (tdk, config) = loop {
+                    tokio::select! {
+                        Some(msg) = progress_rx.recv() => {
+                            state.connection.status =
+                                state::MediatorStatus::Initializing(msg);
+                            self.state_tx.send(state.clone())?;
+                        }
+                        result = &mut load_handle => {
+                            match result {
+                                Ok(Ok((tdk, config))) => break (tdk, config),
+                                Ok(Err(e)) => {
+                                    state.connection.status =
+                                        state::MediatorStatus::Failed(format!("{e}"));
+                                    self.state_tx.send(state.clone())?;
+                                    return self
+                                        .run_degraded_loop(
+                                            &mut action_rx,
+                                            &mut interrupt_rx,
+                                            &mut terminator,
+                                            &mut state,
+                                        )
+                                        .await;
+                                }
+                                Err(join_err) => {
+                                    state.connection.status =
+                                        state::MediatorStatus::Failed(
+                                            format!("Internal error: {join_err}"),
+                                        );
+                                    self.state_tx.send(state.clone())?;
+                                    return self
+                                        .run_degraded_loop(
+                                            &mut action_rx,
+                                            &mut interrupt_rx,
+                                            &mut terminator,
+                                            &mut state,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Some(action) = action_rx.recv() => {
+                            if matches!(action, Action::Exit) {
+                                load_handle.abort();
+                                let _ = terminator.terminate(Interrupted::UserInt);
+                                return Ok(Interrupted::UserInt);
+                            }
+                        }
+                        Ok(interrupted) = interrupt_rx.recv() => {
+                            load_handle.abort();
+                            return Ok(interrupted);
+                        }
+                    }
+                };
+
+                let mut config = config;
+                crate::apply_env_overrides(&mut config);
+
+                let config = Box::new(config);
+                // Update state with full config
+                state.main_page.config = (&config).into();
+
+                (tdk, config)
+            }
             StartingMode::NotSet => {
                 let _ = terminator.terminate(Interrupted::SystemError(
                     "Starting Mode is Not Set!".to_string(),
@@ -123,59 +257,29 @@ impl StateHandler {
             }
         };
 
-        // Initialize DIDComm messaging
-        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
-        let msg_task_handle = if let Some((atm, profile)) =
-            messaging::init_didcomm_connection(&tdk, &config).await
-        {
-            state.connection.status = state::MediatorStatus::Connecting;
-            self.state_tx.send(state.clone())?;
-
-            // Validate the mediator connection with a trust-ping (10s timeout)
-            let persona_did = config.public.persona_did.to_string();
-            let mediator_did = config.public.mediator_did.clone();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                messaging::validate_mediator_connection(
-                    &atm,
-                    &profile,
-                    &mediator_did,
-                    &persona_did,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(latency_ms)) => {
-                    state.connection.status =
-                        state::MediatorStatus::Connected { latency_ms };
-                    state.connection.last_ping_latency_ms = Some(latency_ms);
-                }
-                Ok(Err(e)) => {
-                    state.connection.status =
-                        state::MediatorStatus::Failed(format!("{e}"));
-                }
-                Err(_) => {
-                    state.connection.status =
-                        state::MediatorStatus::Failed("trust-ping timed out".to_string());
-                }
-            }
-
-            // Spawn the message loop
-            let handle = tokio::spawn(messaging::run_didcomm_loop(
-                atm,
-                profile,
-                persona_did,
-                msg_tx,
-                interrupt_rx.resubscribe(),
-            ));
-            state.connection.messaging_active = true;
-            Some(handle)
-        } else {
-            None
-        };
-
-        // Send the initial state once
+        // Send initial state immediately so the UI renders without blocking
+        state.connection.status = state::MediatorStatus::Connecting;
         self.state_tx.send(state.clone())?;
+
+        // Spawn DIDComm init + validation as a background task
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+        let mut msg_task_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        let (conn_result_tx, mut conn_result_rx) =
+            mpsc::channel::<messaging::ConnInitResult>(1);
+        let shared_state = tdk.get_shared_state();
+        let persona_did = config.public.persona_did.to_string();
+        let mediator_did = config.public.mediator_did.clone();
+
+        tokio::spawn(async move {
+            let result = messaging::init_and_validate(
+                shared_state,
+                persona_did,
+                mediator_did,
+            )
+            .await;
+            let _ = conn_result_tx.send(result).await;
+        });
 
         let result = loop {
             tokio::select! {
@@ -210,6 +314,22 @@ impl StateHandler {
                         }
                     },
                     _ => {}
+                },
+                Some(conn_result) = conn_result_rx.recv() => {
+                    state.connection.status = conn_result.status;
+                    state.connection.last_ping_latency_ms = conn_result.latency_ms;
+
+                    if let (Some(atm), Some(profile)) = (conn_result.atm, conn_result.profile) {
+                        let handle = tokio::spawn(messaging::run_didcomm_loop(
+                            atm,
+                            profile,
+                            conn_result.persona_did,
+                            msg_tx.clone(),
+                            interrupt_rx.resubscribe(),
+                        ));
+                        msg_task_handle = Some(handle);
+                        state.connection.messaging_active = true;
+                    }
                 },
                 Some(event) = msg_rx.recv() => {
                     match event {
@@ -252,6 +372,50 @@ impl StateHandler {
         }
 
         Ok(result)
+    }
+
+    /// Minimal event loop for when init fails — keeps UI alive so user sees the error and can exit.
+    async fn run_degraded_loop(
+        &self,
+        action_rx: &mut UnboundedReceiver<Action>,
+        interrupt_rx: &mut broadcast::Receiver<Interrupted>,
+        terminator: &mut Terminator,
+        state: &mut State,
+    ) -> Result<Interrupted> {
+        loop {
+            tokio::select! {
+                Some(action) = action_rx.recv() => match action {
+                    Action::Exit => {
+                        let _ = terminator.terminate(Interrupted::UserInt);
+                        return Ok(Interrupted::UserInt);
+                    }
+                    Action::UXError(interrupted) => {
+                        let _ = terminator.terminate(interrupted.clone());
+                        return Ok(interrupted);
+                    }
+                    Action::MainMenuSelected(menu_item) => {
+                        state.main_page.menu_panel.selected_menu = menu_item;
+                    }
+                    Action::MainPanelSwitch(panel) => {
+                        match panel {
+                            MainPanel::ContentPanel => {
+                                state.main_page.menu_panel.selected = false;
+                                state.main_page.content_panel.selected = true;
+                            }
+                            MainPanel::MainMenu => {
+                                state.main_page.menu_panel.selected = true;
+                                state.main_page.content_panel.selected = false;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(interrupted) = interrupt_rx.recv() => {
+                    return Ok(interrupted);
+                }
+            }
+            self.state_tx.send(state.clone())?;
+        }
     }
 
     async fn setup_wizard(
@@ -382,6 +546,21 @@ impl StateHandler {
                                                     ));
                                                 }
                                             }
+
+                                            // Check for available WebVH servers
+                                            match vta::list_webvh_servers(&acl_client).await {
+                                                Ok(servers) => {
+                                                    if !servers.is_empty() {
+                                                        state.setup.vta.messages.push(MessageType::Info(
+                                                            format!("Found {} WebVH server(s) available for DID hosting.", servers.len()),
+                                                        ));
+                                                    }
+                                                    state.setup.vta.webvh_servers = servers;
+                                                }
+                                                Err(_) => {
+                                                    state.setup.vta.webvh_servers = vec![];
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -444,6 +623,21 @@ impl StateHandler {
                                             state.setup.vta.messages.push(MessageType::Info(
                                                 format!("Could not discover context: {e}"),
                                             ));
+                                        }
+                                    }
+
+                                    // Check for available WebVH servers
+                                    match vta::list_webvh_servers(&acl_client).await {
+                                        Ok(servers) => {
+                                            if !servers.is_empty() {
+                                                state.setup.vta.messages.push(MessageType::Info(
+                                                    format!("Found {} WebVH server(s) available for DID hosting.", servers.len()),
+                                                ));
+                                            }
+                                            state.setup.vta.webvh_servers = servers;
+                                        }
+                                        Err(_) => {
+                                            state.setup.vta.webvh_servers = vec![];
                                         }
                                     }
                                 }
@@ -626,15 +820,117 @@ impl StateHandler {
                         }
                             state.setup.token_cardholder_name.completed = true;
                     }
+                    Action::WebvhServerCreateDid(server_id, custom_path) => {
+                        // Create DID via WebVH server
+                        use crate::state_handler::setup_sequence::vta;
+                        use vta_sdk::client::VtaClient;
+
+                        state.setup.vta.use_webvh_server = true;
+                        state.setup.active_page = SetupPage::WebvhServerProgress;
+                        state.setup.webvh_server.messages.clear();
+                        state.setup.webvh_server.completed = Completion::NotFinished;
+                        state.setup.webvh_server.messages.push(MessageType::Info("Creating DID via WebVH server...".to_string()));
+                        self.state_tx.send(state.clone())?;
+
+                        let access_token = state.setup.vta.access_token.clone().unwrap();
+                        let vta_url = state.setup.vta.vta_url.clone();
+                        let mut client = VtaClient::new(&vta_url);
+                        client.set_token(access_token);
+
+                        let context_id = state.setup.vta.context_id.clone().unwrap_or_default();
+
+                        state.setup.webvh_server.messages.push(MessageType::Info(format!("Server: {}", server_id)));
+                        self.state_tx.send(state.clone())?;
+
+                        match vta::create_did_via_server(
+                            &client,
+                            tdk,
+                            &context_id,
+                            &server_id,
+                            custom_path,
+                        ).await {
+                            Ok((persona_keys, did, document, mnemonic)) => {
+                                state.setup.webvh_server.messages.push(MessageType::Info(format!("DID created: {}", did)));
+                                state.setup.webvh_server.did = did.clone();
+                                state.setup.webvh_server.document = document.clone();
+                                state.setup.webvh_server.mnemonic = mnemonic;
+                                state.setup.webvh_server.completed = Completion::CompletedOK;
+
+                                // Populate did_keys and webvh_address for Config::create compatibility
+                                state.setup.did_keys = Some(persona_keys);
+                                state.setup.webvh_address.did = did;
+                                state.setup.webvh_address.document = document;
+                                state.setup.webvh_address.completed = Completion::CompletedOK;
+                            }
+                            Err(e) => {
+                                state.setup.webvh_server.messages.push(MessageType::Error(format!("Failed: {e}")));
+                                state.setup.webvh_server.completed = Completion::CompletedFail;
+                            }
+                        }
+                    },
                     Action::SetCustomMediator(mediator_did) => {
                         // Set the Custom Mediator in setup state
-                        state.setup.custom_mediator = Some(mediator_did);
-                        state.setup.active_page = SetupPage::UserName;
+                        state.setup.custom_mediator = Some(mediator_did.clone());
+                        if state.setup.vta.use_webvh_server {
+                            // In webvh-server flow, trigger DID creation with the custom mediator
+                            use crate::state_handler::setup_sequence::vta;
+                            use vta_sdk::client::VtaClient;
+
+                            state.setup.active_page = SetupPage::WebvhServerProgress;
+                            state.setup.webvh_server.messages.clear();
+                            state.setup.webvh_server.completed = Completion::NotFinished;
+                            state.setup.webvh_server.messages.push(MessageType::Info("Creating DID via WebVH server...".to_string()));
+                            self.state_tx.send(state.clone())?;
+
+                            let access_token = state.setup.vta.access_token.clone().unwrap();
+                            let vta_url = state.setup.vta.vta_url.clone();
+                            let mut client = VtaClient::new(&vta_url);
+                            client.set_token(access_token);
+
+                            let context_id = state.setup.vta.context_id.clone().unwrap_or_default();
+                            let server_id = state.setup.webvh_server.selected_server_id.clone();
+                            let custom_path = state.setup.webvh_server.custom_path.clone();
+
+                            state.setup.webvh_server.messages.push(MessageType::Info(format!("Server: {}", server_id)));
+                            self.state_tx.send(state.clone())?;
+
+                            match vta::create_did_via_server(
+                                &client,
+                                tdk,
+                                &context_id,
+                                &server_id,
+                                custom_path,
+                            ).await {
+                                Ok((persona_keys, did, document, mnemonic)) => {
+                                    state.setup.webvh_server.messages.push(MessageType::Info(format!("DID created: {}", did)));
+                                    state.setup.webvh_server.did = did.clone();
+                                    state.setup.webvh_server.document = document.clone();
+                                    state.setup.webvh_server.mnemonic = mnemonic;
+                                    state.setup.webvh_server.completed = Completion::CompletedOK;
+
+                                    state.setup.did_keys = Some(persona_keys);
+                                    state.setup.webvh_address.did = did;
+                                    state.setup.webvh_address.document = document;
+                                    state.setup.webvh_address.completed = Completion::CompletedOK;
+                                }
+                                Err(e) => {
+                                    state.setup.webvh_server.messages.push(MessageType::Error(format!("Failed: {e}")));
+                                    state.setup.webvh_server.completed = Completion::CompletedFail;
+                                }
+                            }
+                        } else {
+                            state.setup.active_page = SetupPage::UserName;
+                        }
                     }
                 Action::SetUsername(username) => {
                         // Set the username in setup state
                         state.setup.username = username;
-                        state.setup.active_page = SetupPage::WebVHAddress;
+                        if state.setup.vta.use_webvh_server {
+                            // DID already created and hosted, skip WebVHAddress
+                            state.setup.active_page = SetupPage::FinalPage;
+                        } else {
+                            state.setup.active_page = SetupPage::WebVHAddress;
+                        }
                     },
                     Action::CreateWebVHDID(webvh_address) => {
                         // Set the WebVH DID in setup state
