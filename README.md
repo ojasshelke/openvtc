@@ -11,6 +11,63 @@ capabilities, following the [First Person Project white paper](https://www.first
 for establishing and verifying **first-person trust relationships** using
 Personhood Credentials (PHCs) and Verifiable Relationship Credentials (VRCs).
 
+## Hero Project Overview
+
+OpenVTC is the **identity and trust backbone** of the LFDT
+*[Hero: Contributor Identity Verification Prototype](https://github.com/LF-Decentralized-Trust-Mentorships/mentorship-program/issues/87)*
+LFX mentorship project.
+
+The Hero system closes the identity gap in open-source contribution workflows:
+every pull request can be cryptographically linked to a real person who holds
+a DID-anchored identity and a Verifiable Relationship Credential (VRC) issued
+by a trusted project maintainer.
+
+**End-to-end flow:**
+
+```mermaid
+flowchart LR
+    subgraph Contributor["👩‍💻 Contributor"]
+        CLI["openvtc setup\n(Persona DID + VRC)"]
+        SIGN["did-git-sign\n(DID-signed commits)"]
+    end
+
+    subgraph GitHub["🐙 GitHub"]
+        PR["Pull Request / Push"]
+        APP["GitHub App\n(Webhook listener)"]
+        CHECK["Commit Status /\nCheck Run"]
+    end
+
+    subgraph Hero["⚙️ Hero Verification Service"]
+        WEBHOOK["Webhook Handler"]
+        RESOLVER["DID Resolver"]
+        VRC_CHECK["VRC Verifier\n(openvtc-service)"]
+        DECISION["Verification Decision"]
+    end
+
+    subgraph Infra["🏗️ Infrastructure"]
+        MEDIATOR["DIDComm Mediator"]
+        HEKA["Heka / OTel Pipeline"]
+        DASH["Compliance Dashboard"]
+    end
+
+    CLI -->|"1. generates & hosts DID"| MEDIATOR
+    SIGN -->|"2. DID-signed commit"| PR
+    PR -->|"3. PR event"| APP
+    APP -->|"4. POST /verify"| WEBHOOK
+    WEBHOOK --> RESOLVER
+    RESOLVER --> VRC_CHECK
+    VRC_CHECK -->|"5. decision"| DECISION
+    DECISION -->|"6. check status"| CHECK
+    DECISION -->|"7. emit event"| HEKA
+    HEKA --> DASH
+```
+
+For the full architectural design, component responsibilities, implementation
+roadmap, and trade-off analysis, see:
+**[ADR-001 — Hero Contributor Verification](./docs/architecture/ADR-001-hero-contributor-verification.md)**
+
+---
+
 ## Workspace Crates
 
 | Crate | Description |
@@ -24,6 +81,7 @@ Personhood Credentials (PHCs) and Verifiable Relationship Credentials (VRCs).
 
 ## Table of Contents
 
+- [Hero Project Overview](#hero-project-overview)
 - [Quickstart](#quickstart)
 - [Core Concepts](#core-concepts)
 - [Decentralised Identity](#decentralised-identity)
@@ -316,6 +374,7 @@ See the [did-git-sign README](./did-git-sign/README.md) for full documentation.
 
 Additional resources to learn more about the Open Verifiable Trust Community (OpenVTC) Tool.
 
+- [Hero Project Architecture (ADR-001)](./docs/architecture/ADR-001-hero-contributor-verification.md)
 - [First Person Project White Paper](https://www.firstperson.network/white-paper)
 - [Relationships and VRCs Guide](./docs/relationships-vrcs.md)
 - [Secure Key Management](./docs/secure-key-management.md)
