@@ -52,34 +52,125 @@ impl From<SecuredConfigFormat> for ProtectionMethod {
     }
 }
 
-/// Three possible formats to store [SecuredConfig]
-/// 1. TokenEncrypted - Encrypted using a hardware token
-/// 2. PasswordEncrypted - Encrypted from a derived key from a password/PIN
-/// 3. PlainText - No Encryption at all - USE AT YOUR OWN RISK!
+/// Three possible formats to store [SecuredConfig].
 ///
-/// NOTE: All strings are BASE64 encoded
+/// # Security: Internally-Tagged Format — Downgrade Attack Prevention
+///
+/// ## Threat Model
+/// An adversary with write access to the OS keychain (compromised keychain daemon,
+/// local privilege escalation, or a malicious app granted keychain access) could
+/// previously substitute a `PasswordEncrypted` or `TokenEncrypted` blob with a
+/// crafted `PlainText` blob containing the victim's raw identity material.
+///
+/// With the old `#[serde(untagged)]` design serde tries variants in declaration
+/// order with **no discriminator field in the JSON**.  A blob like:
+/// ```json
+/// {"text": "<base64-of-real-identity-material>"}
+/// ```
+/// would silently deserialize as `PlainText` even when `PublicConfig.protection`
+/// demanded `PasswordEncrypted` — bypassing AES-256-GCM entirely and delivering
+/// the BIP32 seed, VRCs, and relationship keys in cleartext.
+///
+/// ## Fix — Layer 1: Explicit Discriminator
+/// `#[serde(tag = "format")]` writes a mandatory `"format"` key into every stored
+/// blob, e.g. `{"format":"PasswordEncrypted","data":"..."}`.  Any blob that lacks
+/// the `"format"` key — including every blob written by the old code — produces a
+/// hard `serde_json` error rather than silently matching a weaker variant.
+///
+/// ## Fix — Layer 2: Caller-Intent Cross-Validation
+/// See [`assert_format_matches_intent`].  Even if an attacker replaces the blob
+/// with a validly-tagged but weaker format, the second check refuses to proceed
+/// if the stored format does not match what the caller's supplied credentials imply.
+///
+/// ## Breaking Change
+/// All configs stored by the previous untagged format are **no longer loadable**
+/// without migration.  To migrate an existing installation:
+/// 1. Export the config before upgrading (`openvtc export`).
+/// 2. After upgrade, re-import and re-save (`openvtc import`).
+/// The `format_version` convention is `"format": "<Variant>"` itself; future
+/// variants can carry a `v` suffix (e.g. `TokenEncryptedV2`) for graceful migration.
+///
+/// NOTE: All string payloads are BASE64URL (no-pad) encoded.
 #[derive(Serialize, Deserialize, Debug, Zeroize)]
-#[serde(untagged)]
+#[serde(tag = "format")]
 enum SecuredConfigFormat {
     /// Hardware token encrypted data
     TokenEncrypted {
-        /// Encrypted Session Key
+        /// Encrypted Session Key (BASE64URL)
         esk: String,
-        /// Encrypted data using esk
+        /// Encrypted data using esk (BASE64URL)
         data: String,
     },
 
     /// Password/PIN Protected data
     PasswordEncrypted {
-        /// Encrypted data using AES-256 from derived key
+        /// AES-256-GCM ciphertext derived from unlock code via HKDF (BASE64URL)
         data: String,
     },
 
-    /// Plaintext data - dangerous!
+    /// Plaintext data — USE AT YOUR OWN RISK.
+    /// Only valid when `PublicConfig.protection == ConfigProtectionType::Plaintext`.
     PlainText {
-        /// Plaintext data that can be Serialized into [SecuredConfig]
+        /// BASE64URL-encoded raw JSON of [SecuredConfig]
         text: String,
     },
+}
+
+/// Cross-validates the stored [`SecuredConfigFormat`] variant against the
+/// protection level the caller's supplied credentials imply.
+///
+/// # Security rationale
+/// This is **Layer 2** of the downgrade-attack defence (Layer 1 is the
+/// internally-tagged serde format).  Even if an attacker manages to write a
+/// syntactically valid but weaker format into the OS keychain — e.g. a
+/// correctly-tagged `PlainText` blob where a `PasswordEncrypted` blob is
+/// expected — this function refuses to proceed, turning a silent data
+/// exfiltration into a loud, logged error.
+///
+/// The mapping from caller intent to expected format is:
+/// - `has_token == true`               → must be [`SecuredConfigFormat::TokenEncrypted`]
+/// - `has_unlock == true`              → must be [`SecuredConfigFormat::PasswordEncrypted`]
+/// - neither token nor unlock present  → must be [`SecuredConfigFormat::PlainText`]
+///
+/// Any other combination is treated as evidence of tampering.
+fn assert_format_matches_intent(
+    format: &SecuredConfigFormat,
+    has_token: bool,
+    has_unlock: bool,
+) -> Result<(), OpenVTCError> {
+    let matches = match (format, has_token, has_unlock) {
+        (SecuredConfigFormat::TokenEncrypted { .. }, true, _) => true,
+        (SecuredConfigFormat::PasswordEncrypted { .. }, false, true) => true,
+        (SecuredConfigFormat::PlainText { .. }, false, false) => true,
+        _ => false,
+    };
+    if matches {
+        return Ok(());
+    }
+
+    let stored = match format {
+        SecuredConfigFormat::TokenEncrypted { .. } => "token-encrypted",
+        SecuredConfigFormat::PasswordEncrypted { .. } => "password-encrypted",
+        SecuredConfigFormat::PlainText { .. } => "plaintext",
+    };
+    let expected = if has_token {
+        "token-encrypted"
+    } else if has_unlock {
+        "password-encrypted"
+    } else {
+        "plaintext"
+    };
+
+    error!(
+        "SECURITY ALERT: stored config format ({stored}) does not match expected \
+         protection level ({expected}). Possible downgrade attack or config corruption."
+    );
+    Err(OpenVTCError::Config(format!(
+        "Security violation: stored config format '{stored}' does not match \
+         expected protection level '{expected}'. Refusing to load. \
+         If this is a legitimate format migration, re-save your config with the \
+         correct protection method first."
+    )))
 }
 
 impl SecuredConfigFormat {
@@ -313,6 +404,14 @@ impl SecuredConfig {
             }
         };
 
+        // ── Security Gate ─────────────────────────────────────────────────────
+        // Cross-validate the stored format against the caller's supplied
+        // credentials *before* attempting decryption.  This is the second
+        // defence layer against silent encryption-downgrade attacks: even a
+        // correctly-tagged-but-weaker blob (e.g. PlainText where
+        // PasswordEncrypted is expected) is rejected here with a hard error.
+        assert_format_matches_intent(&raw_secured_config, token.is_some(), unlock.is_some())?;
+
         raw_secured_config.unlock(
             #[cfg(feature = "openpgp-card")]
             user_pin,
@@ -515,5 +614,108 @@ mod tests {
             KeySourceMaterial::Imported { seed } => assert!(seed.is_empty()),
             _ => panic!("expected Imported variant"),
         }
+    }
+
+    // ── Security Tests ────────────────────────────────────────────────────────
+
+    /// Verifies that every serialized variant carries the explicit `"format"`
+    /// discriminator required to prevent silent downgrade via field-guessing.
+    #[test]
+    fn test_tagged_format_discriminator_present_in_json() {
+        let token_enc = SecuredConfigFormat::TokenEncrypted {
+            esk: "abc".into(),
+            data: "xyz".into(),
+        };
+        let pass_enc = SecuredConfigFormat::PasswordEncrypted {
+            data: "xyz".into(),
+        };
+        let plain = SecuredConfigFormat::PlainText { text: "xyz".into() };
+
+        let j1 = serde_json::to_string(&token_enc).unwrap();
+        let j2 = serde_json::to_string(&pass_enc).unwrap();
+        let j3 = serde_json::to_string(&plain).unwrap();
+
+        assert!(j1.contains(r#""format":"TokenEncrypted""#), "missing tag: {j1}");
+        assert!(j2.contains(r#""format":"PasswordEncrypted""#), "missing tag: {j2}");
+        assert!(j3.contains(r#""format":"PlainText""#), "missing tag: {j3}");
+    }
+
+    /// An attacker-supplied blob that looks like the old untagged `PlainText`
+    /// format — `{"text":"..."}` without a `"format"` key — must be rejected
+    /// at the deserialization stage, never reaching unlock logic.
+    #[test]
+    fn test_legacy_untagged_blob_rejected_at_parse() {
+        let legacy_plain = r#"{"text":"dGVzdA"}"#;
+        let legacy_pass = r#"{"data":"dGVzdA"}"#;
+        let legacy_token = r#"{"esk":"dGVzdA","data":"dGVzdA"}"#;
+
+        assert!(
+            serde_json::from_str::<SecuredConfigFormat>(legacy_plain).is_err(),
+            "untagged PlainText blob must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<SecuredConfigFormat>(legacy_pass).is_err(),
+            "untagged PasswordEncrypted blob must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<SecuredConfigFormat>(legacy_token).is_err(),
+            "untagged TokenEncrypted blob must be rejected"
+        );
+    }
+
+    /// Caller supplies an unlock code (expects PasswordEncrypted) but the
+    /// stored blob is tagged PlainText → downgrade check must fire.
+    #[test]
+    fn test_downgrade_plaintext_rejected_when_password_expected() {
+        let plain = SecuredConfigFormat::PlainText {
+            text: BASE64_URL_SAFE_NO_PAD.encode(b"{}"),
+        };
+        // has_token=false, has_unlock=true → expects PasswordEncrypted
+        let result = assert_format_matches_intent(&plain, false, true);
+        assert!(
+            result.is_err(),
+            "PlainText must be rejected when PasswordEncrypted is expected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Security violation"), "error must mention security violation: {msg}");
+        assert!(msg.contains("plaintext"), "error must name the stored format: {msg}");
+        assert!(msg.contains("password-encrypted"), "error must name the expected format: {msg}");
+    }
+
+    /// Caller supplies no credentials (expects PlainText) but the stored blob
+    /// is tagged PasswordEncrypted → downgrade check (in reverse) must fire,
+    /// preventing an attacker from forcing unnecessary decryption attempts.
+    #[test]
+    fn test_downgrade_encrypted_rejected_when_plaintext_expected() {
+        let pass_enc = SecuredConfigFormat::PasswordEncrypted {
+            data: BASE64_URL_SAFE_NO_PAD.encode(b"garbage"),
+        };
+        // has_token=false, has_unlock=false → expects PlainText
+        let result = assert_format_matches_intent(&pass_enc, false, false);
+        assert!(
+            result.is_err(),
+            "PasswordEncrypted must be rejected when PlainText is expected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Security violation"), "{msg}");
+        assert!(msg.contains("password-encrypted"), "{msg}");
+        assert!(msg.contains("plaintext"), "{msg}");
+    }
+
+    /// Happy-path: each format variant is accepted when caller intent matches.
+    #[test]
+    fn test_format_intent_happy_paths() {
+        let plain = SecuredConfigFormat::PlainText { text: "x".into() };
+        let pass_enc = SecuredConfigFormat::PasswordEncrypted { data: "x".into() };
+        let token_enc = SecuredConfigFormat::TokenEncrypted {
+            esk: "x".into(),
+            data: "x".into(),
+        };
+
+        assert!(assert_format_matches_intent(&plain, false, false).is_ok());
+        assert!(assert_format_matches_intent(&pass_enc, false, true).is_ok());
+        assert!(assert_format_matches_intent(&token_enc, true, false).is_ok());
+        // token takes precedence: token_enc + both credentials still valid
+        assert!(assert_format_matches_intent(&token_enc, true, true).is_ok());
     }
 }
