@@ -459,10 +459,19 @@ pub enum KeySourceMaterial {
 const NONCE_SIZE: usize = 12;
 /// HKDF info label for key derivation (v2 format)
 const HKDF_INFO: &[u8] = b"openvtc-key-v2";
+/// Fixed domain-separation salt for HKDF (RFC 5869 §3.1).
+///
+/// The unlock code already carries 32 bytes of entropy, so a fixed, labelled
+/// salt is correct here.  Crucially the salt is **not** the AES-GCM nonce —
+/// key derivation and per-message randomness must be kept independent.
+const HKDF_SALT: &[u8] = b"openvtc-unlock-v2-salt";
 
-/// Derives an AES-256-GCM key from the unlock code and nonce using HKDF-SHA256.
-fn derive_key(unlock: &[u8; 32], nonce: &[u8]) -> Result<Aes256Gcm, OpenVTCError> {
-    let hk = Hkdf::<Sha256>::new(Some(nonce), unlock);
+/// Derives a stable AES-256-GCM key from the unlock code using HKDF-SHA256.
+///
+/// Key derivation uses a fixed domain salt; the per-message nonce is passed
+/// separately to AES-GCM, following standard AEAD practice.
+fn derive_key(unlock: &[u8; 32]) -> Result<Aes256Gcm, OpenVTCError> {
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), unlock);
     let mut key_bytes = [0u8; 32];
     hk.expand(HKDF_INFO, &mut key_bytes)
         .map_err(|e| OpenVTCError::Encrypt(format!("HKDF key derivation failed: {e}")))?;
@@ -472,12 +481,15 @@ fn derive_key(unlock: &[u8; 32], nonce: &[u8]) -> Result<Aes256Gcm, OpenVTCError
     Ok(cipher)
 }
 
-/// Encrypts data using AES-256-GCM with HKDF-derived key and random nonce.
+/// Encrypts data using AES-256-GCM with an HKDF-derived key and a fresh random nonce.
+///
+/// Key derivation (HKDF) uses a fixed salt; the AES-GCM nonce is independent
+/// and used solely for per-message randomness — the two roles are not mixed.
 ///
 /// Output format: `[12-byte nonce | ciphertext + auth tag]`
 pub fn unlock_code_encrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let cipher = derive_key(unlock, &nonce)?;
+    let cipher = derive_key(unlock)?;
 
     match cipher.encrypt(&nonce, input) {
         Ok(ciphertext) => {
@@ -494,7 +506,7 @@ pub fn unlock_code_encrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, O
     }
 }
 
-/// Decrypts data using AES-256-GCM with HKDF-derived key.
+/// Decrypts data using AES-256-GCM with an HKDF-derived key.
 ///
 /// Expected input format: `[12-byte nonce | ciphertext + auth tag]`
 pub fn unlock_code_decrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
@@ -506,7 +518,7 @@ pub fn unlock_code_decrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, O
 
     let (nonce_bytes, ciphertext) = input.split_at(NONCE_SIZE);
     let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    let cipher = derive_key(unlock, nonce_bytes)?;
+    let cipher = derive_key(unlock)?;
 
     cipher.decrypt(nonce, ciphertext).map_err(|e| {
         error!("Couldn't decrypt data. Likely due to incorrect unlock code! Reason: {e}");
@@ -626,17 +638,21 @@ mod tests {
             esk: "abc".into(),
             data: "xyz".into(),
         };
-        let pass_enc = SecuredConfigFormat::PasswordEncrypted {
-            data: "xyz".into(),
-        };
+        let pass_enc = SecuredConfigFormat::PasswordEncrypted { data: "xyz".into() };
         let plain = SecuredConfigFormat::PlainText { text: "xyz".into() };
 
         let j1 = serde_json::to_string(&token_enc).unwrap();
         let j2 = serde_json::to_string(&pass_enc).unwrap();
         let j3 = serde_json::to_string(&plain).unwrap();
 
-        assert!(j1.contains(r#""format":"TokenEncrypted""#), "missing tag: {j1}");
-        assert!(j2.contains(r#""format":"PasswordEncrypted""#), "missing tag: {j2}");
+        assert!(
+            j1.contains(r#""format":"TokenEncrypted""#),
+            "missing tag: {j1}"
+        );
+        assert!(
+            j2.contains(r#""format":"PasswordEncrypted""#),
+            "missing tag: {j2}"
+        );
         assert!(j3.contains(r#""format":"PlainText""#), "missing tag: {j3}");
     }
 
@@ -677,9 +693,18 @@ mod tests {
             "PlainText must be rejected when PasswordEncrypted is expected"
         );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Security violation"), "error must mention security violation: {msg}");
-        assert!(msg.contains("plaintext"), "error must name the stored format: {msg}");
-        assert!(msg.contains("password-encrypted"), "error must name the expected format: {msg}");
+        assert!(
+            msg.contains("Security violation"),
+            "error must mention security violation: {msg}"
+        );
+        assert!(
+            msg.contains("plaintext"),
+            "error must name the stored format: {msg}"
+        );
+        assert!(
+            msg.contains("password-encrypted"),
+            "error must name the expected format: {msg}"
+        );
     }
 
     /// Caller supplies no credentials (expects PlainText) but the stored blob
