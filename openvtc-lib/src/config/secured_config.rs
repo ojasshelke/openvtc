@@ -432,6 +432,7 @@ const HKDF_INFO: &[u8] = b"openvtc-key-v2";
 /// **Never change this constant after deployment** — any change would make all
 /// existing v2 blobs permanently undecryptable.  The value was generated from
 /// `/dev/urandom` and is intentionally not a human-readable string.
+#[doc(hidden)]
 const HKDF_SALT: &[u8; 32] = &[
     0x6f, 0x70, 0x65, 0x6e, 0x76, 0x74, 0x63, 0x2d, // "openvtc-"
     0x68, 0x6b, 0x64, 0x66, 0x2d, 0x73, 0x61, 0x6c, // "hkdf-sal"
@@ -487,6 +488,7 @@ fn derive_key_legacy(unlock: &[u8; 32], nonce: &[u8]) -> Result<Aes256Gcm, OpenV
 /// Decrypt a blob that was produced by the **v2** (fixed-salt) scheme.
 ///
 /// Blob format: `[12-byte nonce | ciphertext + 16-byte auth tag]`
+#[doc(hidden)]
 fn unlock_code_decrypt_v2(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
     if input.len() <= NONCE_SIZE {
         return Err(OpenVTCError::Decrypt(
@@ -504,6 +506,7 @@ fn unlock_code_decrypt_v2(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, Op
 /// Decrypt a blob that was produced by the **v1 (legacy)** nonce-as-salt scheme.
 ///
 /// Blob format: `[12-byte nonce | ciphertext + 16-byte auth tag]`
+#[doc(hidden)]
 fn unlock_code_decrypt_legacy(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
     if input.len() <= NONCE_SIZE {
         return Err(OpenVTCError::Decrypt(
@@ -527,7 +530,7 @@ fn unlock_code_decrypt_legacy(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>
 /// Encrypts `input` using AES-256-GCM with an HKDF-derived key (v2 scheme).
 ///
 /// The HKDF key is derived from `unlock` with a fixed, high-entropy salt
-/// ([`HKDF_SALT`]).  A fresh random 12-byte nonce is generated for every call
+/// (`HKDF_SALT`).  A fresh random 12-byte nonce is generated for every call
 /// and prepended to the output.
 ///
 /// Output wire format: `[12-byte nonce | ciphertext + 16-byte auth tag]`
@@ -559,8 +562,8 @@ pub fn unlock_code_encrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, O
 /// an explicit version marker.
 ///
 /// For the main `PasswordEncrypted` config blob where an explicit `version`
-/// field is available, prefer calling [`unlock_code_decrypt_v2`] or
-/// [`unlock_code_decrypt_legacy`] directly so the attempt is not ambiguous.
+/// field is available, prefer calling `unlock_code_decrypt_v2` or
+/// `unlock_code_decrypt_legacy` directly so the attempt is not ambiguous.
 pub fn unlock_code_decrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
     if input.len() <= NONCE_SIZE {
         return Err(OpenVTCError::Decrypt(
