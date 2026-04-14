@@ -26,7 +26,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Constants for storing secure info in the OS Secure Store
@@ -171,6 +171,36 @@ fn assert_format_matches_intent(
          If this is a legitimate format migration, re-save your config with the \
          correct protection method first."
     )))
+}
+
+/// Legacy untagged format — used **only** during one-time migration.
+///
+/// Configs written before the `#[serde(tag = "format")]` change have no
+/// `"format"` key, so serde tries variants in declaration order (untagged).
+/// After a successful migration load the config is immediately re-saved in
+/// the new tagged format; this type is never written to the OS Secure Store.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LegacySecuredConfigFormat {
+    TokenEncrypted { esk: String, data: String },
+    PasswordEncrypted { data: String },
+    PlainText { text: String },
+}
+
+impl From<LegacySecuredConfigFormat> for SecuredConfigFormat {
+    fn from(legacy: LegacySecuredConfigFormat) -> Self {
+        match legacy {
+            LegacySecuredConfigFormat::TokenEncrypted { esk, data } => {
+                SecuredConfigFormat::TokenEncrypted { esk, data }
+            }
+            LegacySecuredConfigFormat::PasswordEncrypted { data } => {
+                SecuredConfigFormat::PasswordEncrypted { data }
+            }
+            LegacySecuredConfigFormat::PlainText { text } => {
+                SecuredConfigFormat::PlainText { text }
+            }
+        }
+    }
 }
 
 impl SecuredConfigFormat {
@@ -386,14 +416,42 @@ impl SecuredConfig {
 
         let raw_secured_config: SecuredConfigFormat = match entry.get_secret() {
             Ok(secret) => match serde_json::from_slice(secret.as_slice()) {
+                // ── Fast path: new tagged format ──────────────────────────────
                 Ok(format) => format,
-                Err(e) => {
-                    error!(
-                        "ERROR: Format of SecuredConfig in OS Secure store is invalid! Reason: {e}"
+                // ── Slow path: try legacy untagged format and migrate ─────────
+                Err(tagged_err) => {
+                    warn!(
+                        "Tagged config deserialization failed ({tagged_err}); \
+                         attempting legacy untagged migration"
                     );
-                    return Err(OpenVTCError::Config(format!(
-                        "Couldn't load openvtc secured configuration. Reason: {e}"
-                    )));
+                    match serde_json::from_slice::<LegacySecuredConfigFormat>(secret.as_slice()) {
+                        Ok(legacy) => {
+                            let migrated = SecuredConfigFormat::from(legacy);
+                            // Re-save immediately so future loads use the new format.
+                            let new_json =
+                                serde_json::to_string_pretty(&migrated).map_err(|e| {
+                                    OpenVTCError::Config(format!(
+                                        "Couldn't serialize migrated config: {e}"
+                                    ))
+                                })?;
+                            entry.set_secret(new_json.as_bytes()).map_err(|e| {
+                                OpenVTCError::Config(format!(
+                                    "Couldn't re-save migrated config to OS Secure Store: {e}"
+                                ))
+                            })?;
+                            info!("Migrated legacy config to new tagged format");
+                            migrated
+                        }
+                        Err(legacy_err) => {
+                            error!(
+                                "ERROR: Format of SecuredConfig in OS Secure Store is invalid! \
+                                 Tagged error: {tagged_err}, Legacy error: {legacy_err}"
+                            );
+                            return Err(OpenVTCError::Config(format!(
+                                "Couldn't load openvtc secured configuration. Reason: {tagged_err}"
+                            )));
+                        }
+                    }
                 }
             },
             Err(e) => {
