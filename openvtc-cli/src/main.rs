@@ -82,7 +82,7 @@ async fn load(profile: &str) -> Result<(TDK, Config)> {
 
     let public_config = Config::load_step1(profile)?;
 
-    let (user_pin, unlock_passphrase) = match &public_config.protection {
+    let (_user_pin, unlock_passphrase) = match &public_config.protection {
         ConfigProtectionType::Token { .. } => {
             let user_pin = Password::with_theme(&ColorfulTheme::default())
                 .with_prompt("Please enter Token User PIN <blank = default>")
@@ -122,7 +122,7 @@ async fn load(profile: &str) -> Result<(TDK, Config)> {
         public_config,
         unlock_passphrase.as_ref(),
         #[cfg(feature = "openpgp-card")]
-        &user_pin,
+        &_user_pin,
         #[cfg(feature = "openpgp-card")]
         &a,
         None,

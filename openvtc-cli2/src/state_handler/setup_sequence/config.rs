@@ -207,6 +207,7 @@ impl ConfigExtension for Config {
         let mut unlock_code = None;
         let protection = match &state.protection {
             ConfigProtection::PlainText => ConfigProtectionType::Plaintext,
+            #[cfg(feature = "openpgp-card")]
             ConfigProtection::Token(token) => ConfigProtectionType::Token(token.to_string()),
             ConfigProtection::Passcode(unlock) => {
                 unlock_code = Some(SecretBox::new(Box::new(unlock.expose_secret().to_vec())));

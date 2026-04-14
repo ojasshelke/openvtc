@@ -9,6 +9,7 @@ use crate::{
 use affinidi_tdk::{TDK, common::config::TDKConfig};
 use anyhow::Result;
 use openvtc::config::{Config, UnlockCode, public_config::PublicConfig};
+#[cfg(feature = "openpgp-card")]
 use secrecy::SecretString;
 use tokio::sync::{
     broadcast,

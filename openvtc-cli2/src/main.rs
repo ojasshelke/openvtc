@@ -1,5 +1,7 @@
+#[cfg(feature = "openpgp-card")]
+use crate::cli::get_user_pin;
 use crate::{
-    cli::{cli, get_user_pin},
+    cli::cli,
     state_handler::{DeferredLoad, StartingMode, StateHandler},
     ui::UiManager,
 };
@@ -12,6 +14,7 @@ use openvtc::{
     errors::OpenVTCError,
     process_lock::{check_duplicate_instance, remove_lock_file},
 };
+#[cfg(feature = "openpgp-card")]
 use secrecy::SecretString;
 use std::env;
 #[cfg(unix)]
