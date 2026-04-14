@@ -87,6 +87,7 @@ impl From<SecuredConfigFormat> for ProtectionMethod {
 /// without migration.  To migrate an existing installation:
 /// 1. Export the config before upgrading (`openvtc export`).
 /// 2. After upgrade, re-import and re-save (`openvtc import`).
+///
 /// The `format_version` convention is `"format": "<Variant>"` itself; future
 /// variants can carry a `v` suffix (e.g. `TokenEncryptedV2`) for graceful migration.
 ///
@@ -138,13 +139,12 @@ fn assert_format_matches_intent(
     has_token: bool,
     has_unlock: bool,
 ) -> Result<(), OpenVTCError> {
-    let matches = match (format, has_token, has_unlock) {
-        (SecuredConfigFormat::TokenEncrypted { .. }, true, _) => true,
-        (SecuredConfigFormat::PasswordEncrypted { .. }, false, true) => true,
-        (SecuredConfigFormat::PlainText { .. }, false, false) => true,
-        _ => false,
-    };
-    if matches {
+    if matches!(
+        (format, has_token, has_unlock),
+        (SecuredConfigFormat::TokenEncrypted { .. }, true, _)
+            | (SecuredConfigFormat::PasswordEncrypted { .. }, false, true)
+            | (SecuredConfigFormat::PlainText { .. }, false, false)
+    ) {
         return Ok(());
     }
 
