@@ -16,7 +16,7 @@ use openvtc::{
     },
     logs::{LogFamily, LogMessage, Logs},
 };
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -209,7 +209,7 @@ impl ConfigExtension for Config {
             ConfigProtection::PlainText => ConfigProtectionType::Plaintext,
             ConfigProtection::Token(token) => ConfigProtectionType::Token(token.to_string()),
             ConfigProtection::Passcode(unlock) => {
-                unlock_code = Some(unlock.expose_secret().to_vec());
+                unlock_code = Some(SecretBox::new(Box::new(unlock.expose_secret().to_vec())));
                 ConfigProtectionType::Encrypted
             }
         };

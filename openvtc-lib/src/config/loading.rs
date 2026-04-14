@@ -271,7 +271,8 @@ impl Config {
             #[cfg(feature = "openpgp-card")]
             token_user_pin: token_user_pin.clone(),
             protection_method: sc.protection_method.clone(),
-            unlock_code: unlock_passphrase.map(|uc| uc.0.expose_secret().to_owned()),
+            unlock_code: unlock_passphrase
+                .map(|uc| SecretBox::new(Box::new(uc.0.expose_secret().to_owned()))),
             atm_profiles,
             vrcs,
         })

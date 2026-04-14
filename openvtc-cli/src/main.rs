@@ -24,7 +24,6 @@ use openvtc::{
     config::{Config, ConfigProtectionType, UnlockCode},
 };
 use secrecy::SecretString;
-use sha2::Digest;
 use status::print_status;
 use std::{env, fs, path::Path, process, str::FromStr};
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
@@ -436,8 +435,8 @@ async fn openvtc(term: &Term, profile: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompts user for their unlock code when not using a hardware token
-/// returns the SHA256 hash of whatever they entered
+/// Prompts user for their unlock code when not using a hardware token.
+/// Derives a 32-byte key via Argon2id (same KDF as `UnlockCode::from_string`).
 pub fn get_unlock_code() -> Result<[u8; 32]> {
     let unlock_code = Password::with_theme(&ColorfulTheme::default())
         .with_prompt("Please enter your openvtc unlock code")
@@ -445,5 +444,8 @@ pub fn get_unlock_code() -> Result<[u8; 32]> {
         .interact()
         .map_err(|e| anyhow::anyhow!("Failed to read unlock code: {e}"))?;
 
-    Ok(sha2::Sha256::digest(unlock_code.as_bytes()).into())
+    Ok(openvtc::config::derive_passphrase_key(
+        unlock_code.as_bytes(),
+        b"openvtc-unlock-code-v1",
+    )?)
 }

@@ -44,7 +44,8 @@ mod serde_secret_str {
         s.serialize_str(v.expose_secret())
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SecretString, D::Error> {
-        Ok(SecretString::new(String::deserialize(d)?))
+        // secrecy 0.10: SecretString::new() takes Box<str>, not String
+        Ok(SecretString::new(String::deserialize(d)?.into()))
     }
 }
 mod serde_opt_secret_str {
@@ -57,7 +58,8 @@ mod serde_opt_secret_str {
         }
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SecretString>, D::Error> {
-        Ok(Option::<String>::deserialize(d)?.map(SecretString::new))
+        // secrecy 0.10: SecretString::new() takes Box<str>, not String
+        Ok(Option::<String>::deserialize(d)?.map(|s| SecretString::new(s.into())))
     }
 }
 
@@ -564,13 +566,49 @@ mod tests {
         // SecretString zeroes itself via ZeroizeOnDrop when dropped.
         // We just verify the variant is constructed and accessible correctly.
         let source = KeySourceMaterial::Imported {
-            seed: SecretString::new("z6MkTestSeed123456789".to_string()),
+            seed: SecretString::new("z6MkTestSeed123456789".into()),
         };
         match &source {
             KeySourceMaterial::Imported { seed } => {
                 assert!(!seed.expose_secret().is_empty())
             }
             _ => panic!("expected Imported variant"),
+        }
+    }
+
+    #[test]
+    fn test_bip32_seed_is_secret_string() {
+        // Verify that SecretString cannot be printed via Debug or Display,
+        // proving the seed value never leaks through formatting.
+        let config = SecuredConfig {
+            bip32_seed: Some(SecretString::new("super-secret-seed-value".into())),
+            credential_bundle: None,
+            vta_url: None,
+            vta_did: None,
+            key_info: std::collections::HashMap::new(),
+            protection_method: ProtectionMethod::default(),
+        };
+        let debug = format!("{:?}", config);
+        assert!(
+            !debug.contains("super-secret-seed-value"),
+            "SecretString must not leak through Debug formatting"
+        );
+    }
+
+    #[test]
+    fn test_imported_seed_requires_expose() {
+        // Prove that the seed field can only be accessed through expose_secret(),
+        // preventing accidental plaintext access.
+        let material = KeySourceMaterial::Imported {
+            seed: SecretString::new("z6MkSensitiveKeyData".into()),
+        };
+        let json = serde_json::to_string(&material).unwrap();
+        // The serde module deliberately exposes the value for serialization only.
+        assert!(json.contains("z6MkSensitiveKeyData"));
+        // But the Rust type system prevents direct field access — must go through
+        // expose_secret(). This test documents the security invariant.
+        if let KeySourceMaterial::Imported { seed } = &material {
+            assert_eq!(seed.expose_secret(), "z6MkSensitiveKeyData");
         }
     }
 }
