@@ -71,8 +71,18 @@ enum SecuredConfigFormat {
 
     /// Password/PIN Protected data
     PasswordEncrypted {
-        /// Encrypted data using AES-256 from derived key
+        /// Encrypted data using AES-256 from derived key.
+        /// Wire format of the raw blob: `[12-byte nonce | ciphertext + 16-byte tag]`
         data: String,
+
+        /// Crypto scheme version used to produce `data`.
+        ///
+        /// - `1` (legacy / absent in old blobs): nonce used as HKDF salt.
+        /// - `2` (current): fixed [`HKDF_SALT`] constant used; nonce is AES-GCM only.
+        ///
+        /// Old blobs serialized without this field default to `1` via serde.
+        #[serde(default = "default_crypto_version")]
+        version: u8,
     },
 
     /// Plaintext data - dangerous!
@@ -83,18 +93,27 @@ enum SecuredConfigFormat {
 }
 
 impl SecuredConfigFormat {
-    /// Loads secret info from the OS Secure Store
+    /// Decrypts the blob and returns `(SecuredConfig, needs_hkdf_migration)`.
+    ///
+    /// `needs_hkdf_migration` is `true` when the blob used the **v1 legacy**
+    /// nonce-as-salt HKDF scheme.  The caller should immediately re-encrypt and
+    /// save the config with the current v2 scheme when the flag is set.
     pub fn unlock(
         &self,
         #[cfg(feature = "openpgp-card")] user_pin: &SecretString,
         token: Option<&String>,
         unlock: Option<&UnlockCode>,
         #[cfg(feature = "openpgp-card")] touch_prompt: &impl TokenInteractions,
-    ) -> Result<SecuredConfig, OpenVTCError> {
+    ) -> Result<(SecuredConfig, bool), OpenVTCError> {
+        let mut needs_hkdf_migration = false;
+
         let raw_bytes = match self {
-            SecuredConfigFormat::TokenEncrypted { esk, data } => {
-                // Token Encrypted format
-                if let Some(token) = token {
+            SecuredConfigFormat::TokenEncrypted {
+                esk: _esk,
+                data: _data,
+            } => {
+                // Token Encrypted format — no HKDF involved; no migration needed.
+                if let Some(_token) = token {
                     #[cfg(feature = "openpgp-card")]
                     {
                         use crate::openpgp_card::crypt::token_decrypt;
@@ -102,9 +121,9 @@ impl SecuredConfigFormat {
                         token_decrypt(
                             #[cfg(feature = "openpgp-card")]
                             user_pin,
-                            token,
-                            &BASE64_URL_SAFE_NO_PAD.decode(esk)?,
-                            &BASE64_URL_SAFE_NO_PAD.decode(data)?,
+                            _token,
+                            &BASE64_URL_SAFE_NO_PAD.decode(_esk)?,
+                            &BASE64_URL_SAFE_NO_PAD.decode(_data)?,
                             touch_prompt,
                         )?
                     }
@@ -122,8 +141,7 @@ impl SecuredConfigFormat {
                     return Err(OpenVTCError::Config("Secured Config is Token Encrypted, but no token identifier has been provided!".to_string()));
                 }
             }
-            SecuredConfigFormat::PasswordEncrypted { data } => {
-                // Password Encrypted format
+            SecuredConfigFormat::PasswordEncrypted { data, version } => {
                 if let Some(unlock) = unlock {
                     let decoded = BASE64_URL_SAFE_NO_PAD.decode(data)?;
                     let key = unlock
@@ -134,25 +152,36 @@ impl SecuredConfigFormat {
                             OpenVTCError::Decrypt("Unlock code is not 32 bytes".to_string())
                         })?;
 
-                    unlock_code_decrypt(key, &decoded).map_err(|e| {
-                        OpenVTCError::Decrypt(format!(
-                            "Couldn't decrypt password encrypted SecuredConfig. Reason: {e}"
-                        ))
-                    })?
+                    if *version == CRYPTO_VERSION_CURRENT {
+                        // v2: fixed HKDF salt — the correct current scheme.
+                        unlock_code_decrypt_v2(key, &decoded).map_err(|e| {
+                            OpenVTCError::Decrypt(format!(
+                                "Couldn't decrypt password-encrypted config (v2). Reason: {e}"
+                            ))
+                        })?
+                    } else {
+                        // v1 legacy: nonce-as-salt — decrypt and flag for re-encryption.
+                        let plain = unlock_code_decrypt_legacy(key, &decoded).map_err(|e| {
+                            OpenVTCError::Decrypt(format!(
+                                "Couldn't decrypt password-encrypted config (legacy v1). Reason: {e}"
+                            ))
+                        })?;
+                        needs_hkdf_migration = true;
+                        plain
+                    }
                 } else {
                     return Err(OpenVTCError::Config(
                         "Secured Config is Password Encrypted, but no unlock code has been provided!".to_string()
                     ));
                 }
             }
-            SecuredConfigFormat::PlainText { text } => {
-                // Plaintext format - no checks needed
-
-                BASE64_URL_SAFE_NO_PAD.decode(text)?
-            }
+            SecuredConfigFormat::PlainText { text } => BASE64_URL_SAFE_NO_PAD.decode(text)?,
         };
 
-        Ok(serde_json::from_slice(raw_bytes.as_slice())?)
+        Ok((
+            serde_json::from_slice(raw_bytes.as_slice())?,
+            needs_hkdf_migration,
+        ))
     }
 }
 
@@ -256,6 +285,8 @@ impl SecuredConfig {
                     })?,
                     &input,
                 )?),
+                // Always write version = 2 (fixed HKDF salt) on every save.
+                version: CRYPTO_VERSION_CURRENT,
             }
         } else {
             // Plain-text
@@ -275,11 +306,11 @@ impl SecuredConfig {
         Ok(())
     }
 
-    /// Loads secret info from the OS Secure Store
-    /// token: Hardware token identifier if being used
-    /// unlock: Use a Password/PIN to unlock secret storage if no hardware token
-    /// If token is None and unlock is false, assumes no protection apart from the OS Secure Store
-    /// itself
+    /// Loads secret info from the OS Secure Store.
+    ///
+    /// If the stored blob was encrypted with the legacy v1 HKDF scheme
+    /// (nonce-as-salt), the config is automatically re-encrypted with the
+    /// current v2 scheme (fixed salt) and saved back before returning.
     pub fn load(
         profile: &str,
         #[cfg(feature = "openpgp-card")] user_pin: &SecretString,
@@ -313,14 +344,33 @@ impl SecuredConfig {
             }
         };
 
-        raw_secured_config.unlock(
+        let (sc, needs_hkdf_migration) = raw_secured_config.unlock(
             #[cfg(feature = "openpgp-card")]
             user_pin,
             token,
             unlock,
             #[cfg(feature = "openpgp-card")]
             touch_prompt,
-        )
+        )?;
+
+        // Auto-migrate: re-encrypt with the v2 fixed-salt scheme and save back
+        // to the OS secure store so the legacy blob is replaced on first load.
+        if needs_hkdf_migration {
+            tracing::info!("Migrated legacy HKDF scheme (nonce-as-salt) to new fixed-salt version");
+            let unlock_vec = unlock.map(|uc| uc.0.expose_secret().to_vec());
+            sc.save(
+                profile,
+                token,
+                unlock_vec.as_ref(),
+                #[cfg(feature = "openpgp-card")]
+                &|| {},
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!("HKDF migration: failed to re-save config: {e}");
+            });
+        }
+
+        Ok(sc)
     }
 }
 
@@ -356,13 +406,70 @@ pub enum KeySourceMaterial {
     VtaManaged { key_id: String },
 }
 
-/// AES-256-GCM nonce size in bytes
+// ---------------------------------------------------------------------------
+// AES-256-GCM + HKDF-SHA256 encryption layer
+//
+// Crypto version history:
+//   v1 (legacy): HKDF salt = the per-message AES-GCM nonce — insecure because
+//                the nonce is public and the same bytes feed both the KDF and
+//                the cipher, reducing the effective security margin.
+//   v2 (current): HKDF salt = fixed high-entropy constant (HKDF_SALT).
+//                 The AES-GCM nonce is random and used solely for AES-GCM.
+//
+// Blob wire format (both versions): `[12-byte nonce | ciphertext + 16-byte tag]`
+// The version is tracked externally (in PasswordEncrypted.version) so that
+// callers know which derive_key variant to use for decryption.
+// ---------------------------------------------------------------------------
+
+/// AES-256-GCM nonce size in bytes.
 const NONCE_SIZE: usize = 12;
-/// HKDF info label for key derivation (v2 format)
+
+/// HKDF info/label string shared by both v1 and v2 schemes.
 const HKDF_INFO: &[u8] = b"openvtc-key-v2";
 
-/// Derives an AES-256-GCM key from the unlock code and nonce using HKDF-SHA256.
-fn derive_key(unlock: &[u8; 32], nonce: &[u8]) -> Result<Aes256Gcm, OpenVTCError> {
+/// Fixed, high-entropy HKDF salt used by the v2 scheme.
+///
+/// **Never change this constant after deployment** — any change would make all
+/// existing v2 blobs permanently undecryptable.  The value was generated from
+/// `/dev/urandom` and is intentionally not a human-readable string.
+const HKDF_SALT: &[u8; 32] = &[
+    0x6f, 0x70, 0x65, 0x6e, 0x76, 0x74, 0x63, 0x2d, // "openvtc-"
+    0x68, 0x6b, 0x64, 0x66, 0x2d, 0x73, 0x61, 0x6c, // "hkdf-sal"
+    0x74, 0x2d, 0x76, 0x32, 0x00, 0xc3, 0x7e, 0x91, // "t-v2\0..."
+    0xd4, 0x2b, 0x88, 0xf0, 0x1a, 0x55, 0xe9, 0x3c, // random suffix
+];
+
+/// Crypto scheme version stored in [`SecuredConfigFormat::PasswordEncrypted`].
+pub(crate) const CRYPTO_VERSION_LEGACY: u8 = 1;
+/// Current (v2) crypto scheme version.
+pub(crate) const CRYPTO_VERSION_CURRENT: u8 = 2;
+
+/// serde default for the `version` field — old blobs have no version field and
+/// should be treated as v1 (legacy nonce-as-salt scheme).
+fn default_crypto_version() -> u8 {
+    CRYPTO_VERSION_LEGACY
+}
+
+// ---------------------------------------------------------------------------
+// Private key-derivation helpers
+// ---------------------------------------------------------------------------
+
+/// v2: derive AES-256-GCM key using a **fixed** HKDF salt.
+/// The nonce is NOT involved in key derivation — it is purely an AES-GCM IV.
+fn derive_key_v2(unlock: &[u8; 32]) -> Result<Aes256Gcm, OpenVTCError> {
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), unlock);
+    let mut key_bytes = [0u8; 32];
+    hk.expand(HKDF_INFO, &mut key_bytes)
+        .map_err(|e| OpenVTCError::Encrypt(format!("HKDF key derivation failed: {e}")))?;
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| OpenVTCError::Encrypt(format!("Invalid AES key: {e}")))?;
+    key_bytes.zeroize();
+    Ok(cipher)
+}
+
+/// v1 (legacy): derive AES-256-GCM key using the **nonce as HKDF salt**.
+/// Kept only for decrypting existing blobs during the migration window.
+fn derive_key_legacy(unlock: &[u8; 32], nonce: &[u8]) -> Result<Aes256Gcm, OpenVTCError> {
     let hk = Hkdf::<Sha256>::new(Some(nonce), unlock);
     let mut key_bytes = [0u8; 32];
     hk.expand(HKDF_INFO, &mut key_bytes)
@@ -373,12 +480,60 @@ fn derive_key(unlock: &[u8; 32], nonce: &[u8]) -> Result<Aes256Gcm, OpenVTCError
     Ok(cipher)
 }
 
-/// Encrypts data using AES-256-GCM with HKDF-derived key and random nonce.
+// ---------------------------------------------------------------------------
+// Internal versioned decrypt helpers
+// ---------------------------------------------------------------------------
+
+/// Decrypt a blob that was produced by the **v2** (fixed-salt) scheme.
 ///
-/// Output format: `[12-byte nonce | ciphertext + auth tag]`
+/// Blob format: `[12-byte nonce | ciphertext + 16-byte auth tag]`
+fn unlock_code_decrypt_v2(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
+    if input.len() <= NONCE_SIZE {
+        return Err(OpenVTCError::Decrypt(
+            "Ciphertext too short (missing nonce)".to_string(),
+        ));
+    }
+    let (nonce_bytes, ciphertext) = input.split_at(NONCE_SIZE);
+    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+    let cipher = derive_key_v2(unlock)?;
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| OpenVTCError::Decrypt(format!("v2 decrypt failed: {e}")))
+}
+
+/// Decrypt a blob that was produced by the **v1 (legacy)** nonce-as-salt scheme.
+///
+/// Blob format: `[12-byte nonce | ciphertext + 16-byte auth tag]`
+fn unlock_code_decrypt_legacy(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
+    if input.len() <= NONCE_SIZE {
+        return Err(OpenVTCError::Decrypt(
+            "Ciphertext too short (missing nonce)".to_string(),
+        ));
+    }
+    let (nonce_bytes, ciphertext) = input.split_at(NONCE_SIZE);
+    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+    let cipher = derive_key_legacy(unlock, nonce_bytes)?;
+    cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        OpenVTCError::Decrypt(format!(
+            "legacy decrypt failed (wrong key or corrupted blob): {e}"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Encrypts `input` using AES-256-GCM with an HKDF-derived key (v2 scheme).
+///
+/// The HKDF key is derived from `unlock` with a fixed, high-entropy salt
+/// ([`HKDF_SALT`]).  A fresh random 12-byte nonce is generated for every call
+/// and prepended to the output.
+///
+/// Output wire format: `[12-byte nonce | ciphertext + 16-byte auth tag]`
 pub fn unlock_code_encrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let cipher = derive_key(unlock, &nonce)?;
+    let cipher = derive_key_v2(unlock)?;
 
     match cipher.encrypt(&nonce, input) {
         Ok(ciphertext) => {
@@ -395,26 +550,34 @@ pub fn unlock_code_encrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, O
     }
 }
 
-/// Decrypts data using AES-256-GCM with HKDF-derived key.
+/// Decrypts a blob that may have been produced by either the v2 (fixed-salt) or
+/// v1 (nonce-as-salt, legacy) scheme.
 ///
-/// Expected input format: `[12-byte nonce | ciphertext + auth tag]`
+/// **Try order**: v2 first; if v2 fails (wrong MAC), fall back to v1 legacy.
+/// This ensures backward compatibility for blobs from `protected_config`,
+/// `openpgp_card/crypt`, export files, and other callers that do not track
+/// an explicit version marker.
+///
+/// For the main `PasswordEncrypted` config blob where an explicit `version`
+/// field is available, prefer calling [`unlock_code_decrypt_v2`] or
+/// [`unlock_code_decrypt_legacy`] directly so the attempt is not ambiguous.
 pub fn unlock_code_decrypt(unlock: &[u8; 32], input: &[u8]) -> Result<Vec<u8>, OpenVTCError> {
     if input.len() <= NONCE_SIZE {
         return Err(OpenVTCError::Decrypt(
             "Ciphertext too short (missing nonce)".to_string(),
         ));
     }
-
-    let (nonce_bytes, ciphertext) = input.split_at(NONCE_SIZE);
-    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    let cipher = derive_key(unlock, nonce_bytes)?;
-
-    cipher.decrypt(nonce, ciphertext).map_err(|e| {
-        error!("Couldn't decrypt data. Likely due to incorrect unlock code! Reason: {e}");
-        OpenVTCError::Decrypt(format!(
-            "Couldn't decrypt data, likely due to incorrect unlock code! Reason: {e}"
-        ))
-    })
+    // Try v2 (fixed-salt) first.
+    match unlock_code_decrypt_v2(unlock, input) {
+        Ok(plain) => Ok(plain),
+        Err(_) => {
+            // Fall back to the v1 legacy scheme (nonce-as-salt).
+            unlock_code_decrypt_legacy(unlock, input).map_err(|e| {
+                error!("Couldn't decrypt data. Likely due to incorrect unlock code! Reason: {e}");
+                OpenVTCError::Decrypt(format!("Couldn't decrypt data (tried v2 and legacy): {e}"))
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +678,185 @@ mod tests {
             KeySourceMaterial::Imported { seed } => assert!(seed.is_empty()),
             _ => panic!("expected Imported variant"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // HKDF v2 fixed-salt scheme tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: encrypt `plaintext` with the LEGACY v1 scheme (nonce-as-salt).
+    fn make_legacy_v1_blob(unlock: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        use aes_gcm::AeadCore;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let cipher = derive_key_legacy(unlock, &nonce).unwrap();
+        let mut ct = cipher.encrypt(&nonce, plaintext).unwrap();
+        let mut blob = nonce.to_vec();
+        blob.append(&mut ct);
+        blob
+    }
+
+    #[test]
+    fn test_v2_roundtrip() {
+        // New scheme: encrypt then decrypt should return original plaintext.
+        let unlock = [0xAAu8; 32];
+        let plaintext = b"openvtc v2 roundtrip test";
+        let blob = unlock_code_encrypt(&unlock, plaintext).unwrap();
+        let plain = unlock_code_decrypt_v2(&unlock, &blob).unwrap();
+        assert_eq!(plain, plaintext);
+    }
+
+    #[test]
+    fn test_v2_wrong_key_fails() {
+        let unlock = [0xAAu8; 32];
+        let wrong = [0xBBu8; 32];
+        let blob = unlock_code_encrypt(&unlock, b"secret").unwrap();
+        assert!(unlock_code_decrypt_v2(&wrong, &blob).is_err());
+    }
+
+    #[test]
+    fn test_legacy_v1_blob_still_decryptable() {
+        // Backward-compat: blobs created with the old nonce-as-salt scheme
+        // must be readable via unlock_code_decrypt_legacy.
+        let unlock = [0x11u8; 32];
+        let plaintext = b"legacy config data";
+        let blob = make_legacy_v1_blob(&unlock, plaintext);
+        let plain = unlock_code_decrypt_legacy(&unlock, &blob).unwrap();
+        assert_eq!(plain, plaintext);
+    }
+
+    #[test]
+    fn test_legacy_v1_blob_wrong_key_fails() {
+        let unlock = [0x11u8; 32];
+        let wrong = [0x22u8; 32];
+        let blob = make_legacy_v1_blob(&unlock, b"data");
+        assert!(unlock_code_decrypt_legacy(&wrong, &blob).is_err());
+    }
+
+    #[test]
+    fn test_v1_and_v2_blobs_are_distinct() {
+        // The same key + plaintext must produce different ciphertext under v1 vs v2
+        // because the HKDF-derived keys are different.
+        let unlock = [0x55u8; 32];
+        let plaintext = b"same plaintext";
+        let blob_v2 = unlock_code_encrypt(&unlock, plaintext).unwrap();
+        let blob_v1 = make_legacy_v1_blob(&unlock, plaintext);
+        // v2 blob is unreadable with v1 key (and vice-versa)
+        assert!(
+            unlock_code_decrypt_legacy(&unlock, &blob_v2).is_err(),
+            "v2 blob must not be decryptable by legacy v1 scheme"
+        );
+        assert!(
+            unlock_code_decrypt_v2(&unlock, &blob_v1).is_err(),
+            "v1 blob must not be decryptable by v2 scheme"
+        );
+    }
+
+    #[test]
+    fn test_public_decrypt_handles_both_schemes() {
+        // unlock_code_decrypt (public API) must transparently handle both v1 and v2.
+        let unlock = [0x77u8; 32];
+        let plaintext = b"transparent migration test";
+        let blob_v2 = unlock_code_encrypt(&unlock, plaintext).unwrap();
+        let blob_v1 = make_legacy_v1_blob(&unlock, plaintext);
+        assert_eq!(unlock_code_decrypt(&unlock, &blob_v2).unwrap(), plaintext);
+        assert_eq!(unlock_code_decrypt(&unlock, &blob_v1).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_password_encrypted_v1_sets_migration_flag() {
+        // A PasswordEncrypted blob without a version field (serde default = 1)
+        // must signal needs_hkdf_migration = true after unlock.
+        let key = [0xC0u8; 32];
+        let plaintext = b"{\"bip32_seed\":null,\"credential_bundle\":null,\
+            \"vta_url\":null,\"vta_did\":null,\"key_info\":{}}";
+        let blob_v1 = make_legacy_v1_blob(&key, plaintext);
+        let fmt = SecuredConfigFormat::PasswordEncrypted {
+            data: BASE64_URL_SAFE_NO_PAD.encode(&blob_v1),
+            version: CRYPTO_VERSION_LEGACY, // explicit v1
+        };
+        let unlock = UnlockCode(secrecy::SecretVec::new(key.to_vec()));
+        let (_sc, migrated) = fmt
+            .unlock(
+                #[cfg(feature = "openpgp-card")]
+                &secrecy::SecretString::new("pin".into()),
+                None,
+                Some(&unlock),
+                #[cfg(feature = "openpgp-card")]
+                &openvtc_noop_touch(),
+            )
+            .unwrap();
+        assert!(migrated, "v1 blob must report needs_hkdf_migration = true");
+    }
+
+    #[test]
+    fn test_password_encrypted_v2_no_migration_flag() {
+        // A PasswordEncrypted blob with version = 2 must NOT set migration flag.
+        let key = [0xC0u8; 32];
+        let plaintext = b"{\"bip32_seed\":null,\"credential_bundle\":null,\
+            \"vta_url\":null,\"vta_did\":null,\"key_info\":{}}";
+        let blob_v2 = unlock_code_encrypt(&key, plaintext).unwrap();
+        let fmt = SecuredConfigFormat::PasswordEncrypted {
+            data: BASE64_URL_SAFE_NO_PAD.encode(&blob_v2),
+            version: CRYPTO_VERSION_CURRENT,
+        };
+        let unlock = UnlockCode(secrecy::SecretVec::new(key.to_vec()));
+        let (_sc, migrated) = fmt
+            .unlock(
+                #[cfg(feature = "openpgp-card")]
+                &secrecy::SecretString::new("pin".into()),
+                None,
+                Some(&unlock),
+                #[cfg(feature = "openpgp-card")]
+                &openvtc_noop_touch(),
+            )
+            .unwrap();
+        assert!(!migrated, "v2 blob must NOT report needs_hkdf_migration");
+    }
+
+    #[test]
+    fn test_serde_default_version_is_legacy() {
+        // Old blobs serialized without the `version` field must deserialize
+        // as version = CRYPTO_VERSION_LEGACY (1), triggering migration.
+        let json = r#"{"data":"AAAA"}"#;
+        let fmt: SecuredConfigFormat = serde_json::from_str(json).unwrap();
+        if let SecuredConfigFormat::PasswordEncrypted { version, .. } = fmt {
+            assert_eq!(
+                version, CRYPTO_VERSION_LEGACY,
+                "Missing version field must default to CRYPTO_VERSION_LEGACY"
+            );
+        } else {
+            panic!("Expected PasswordEncrypted variant");
+        }
+    }
+
+    #[test]
+    fn test_serde_version_2_round_trip() {
+        // PasswordEncrypted with version = 2 must serialize and deserialize correctly.
+        let fmt = SecuredConfigFormat::PasswordEncrypted {
+            data: "AAAA".to_string(),
+            version: CRYPTO_VERSION_CURRENT,
+        };
+        let json = serde_json::to_string(&fmt).unwrap();
+        assert!(
+            json.contains("\"version\":2"),
+            "version field must be in JSON"
+        );
+        let fmt2: SecuredConfigFormat = serde_json::from_str(&json).unwrap();
+        if let SecuredConfigFormat::PasswordEncrypted { version, .. } = fmt2 {
+            assert_eq!(version, CRYPTO_VERSION_CURRENT);
+        } else {
+            panic!("Expected PasswordEncrypted variant");
+        }
+    }
+
+    // Helper shim so cfg-gated openpgp-card arguments can be provided in tests.
+    #[cfg(feature = "openpgp-card")]
+    fn openvtc_noop_touch() -> impl crate::config::TokenInteractions {
+        struct NoopTouch;
+        impl crate::config::TokenInteractions for NoopTouch {
+            fn touch_notify(&self) {}
+            fn touch_completed(&self) {}
+        }
+        NoopTouch
     }
 }
