@@ -248,7 +248,12 @@ impl SecuredConfigFormat {
         let mut needs_hkdf_migration = false;
 
         let raw_bytes = match self {
-            SecuredConfigFormat::TokenEncrypted { esk, data } => {
+            // `_esk` / `_data` suppress unused-variable warnings when compiled
+            // without the `openpgp-card` feature flag.
+            SecuredConfigFormat::TokenEncrypted {
+                esk: _esk,
+                data: _data,
+            } => {
                 // Token Encrypted format — no HKDF involved; no migration needed.
                 if let Some(token) = token {
                     #[cfg(feature = "openpgp-card")]
@@ -259,8 +264,8 @@ impl SecuredConfigFormat {
                             #[cfg(feature = "openpgp-card")]
                             user_pin,
                             token,
-                            &BASE64_URL_SAFE_NO_PAD.decode(esk)?,
-                            &BASE64_URL_SAFE_NO_PAD.decode(data)?,
+                            &BASE64_URL_SAFE_NO_PAD.decode(_esk)?,
+                            &BASE64_URL_SAFE_NO_PAD.decode(_data)?,
                             touch_prompt,
                         )?
                     }
