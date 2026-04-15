@@ -109,7 +109,7 @@ impl From<SecuredConfigFormat> for ProtectionMethod {
 /// hard `serde_json` error rather than silently matching a weaker variant.
 ///
 /// ## Fix — Layer 2: Caller-Intent Cross-Validation
-/// See [`assert_format_matches_intent`].  Even if an attacker replaces the blob
+/// See `assert_format_matches_intent`.  Even if an attacker replaces the blob
 /// with a validly-tagged but weaker format, the second check refuses to proceed
 /// if the stored format does not match what the caller's supplied credentials imply.
 ///
@@ -152,7 +152,7 @@ enum SecuredConfigFormat {
         /// Crypto scheme version used to produce `data`.
         ///
         /// - `1` (legacy / absent in old blobs): nonce used as HKDF salt.
-        /// - `2` (current): fixed [`HKDF_SALT`] constant used; nonce is AES-GCM only.
+        /// - `2` (current): fixed `HKDF_SALT` constant used; nonce is AES-GCM only.
         ///
         /// Old blobs serialized without this field default to `1` via serde.
         #[serde(default = "default_crypto_version")]
@@ -511,7 +511,7 @@ impl SecuredConfig {
     ///    v1 nonce-as-salt scheme (`version` absent or `1`) are re-encrypted
     ///    with the current v2 fixed-salt scheme on first load.
     ///
-    /// The security gate ([`assert_format_matches_intent`]) always runs **before**
+    /// The security gate (`assert_format_matches_intent`) always runs **before**
     /// any re-save so that a downgrade attack cannot be laundered through the
     /// migration path.  A single re-save is performed when either (or both)
     /// migrations are needed.
