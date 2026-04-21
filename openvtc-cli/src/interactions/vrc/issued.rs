@@ -122,6 +122,7 @@ pub async fn handle_inbound_vrc_issued(
 }
 
 /// Handles the user interaction for an inbound VRC that has been issued to you
+#[allow(clippy::collapsible_match)]
 pub fn interact_vrc_inbound(
     config: &mut Config,
     task: &Arc<Mutex<Task>>,

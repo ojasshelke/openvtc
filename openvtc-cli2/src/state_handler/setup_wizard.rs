@@ -18,6 +18,7 @@ use secrecy::SecretString;
 use tokio::sync::{broadcast, mpsc::UnboundedReceiver};
 
 impl StateHandler {
+    #[allow(clippy::collapsible_match)]
     pub(crate) async fn setup_wizard(
         &self,
         action_rx: &mut UnboundedReceiver<Action>,

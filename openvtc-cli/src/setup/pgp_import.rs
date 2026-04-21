@@ -45,6 +45,7 @@ impl PGPKeys {
     }
 
     /// Confirms via the terminal if a valid imported key should be used for a specific purpose
+    #[allow(clippy::collapsible_match)]
     pub fn confirm_key_use(&mut self, key: KeyInfo, purpose: KeyPurpose) {
         // Change the expiry of the key if needed?
         let Ok(key) = modify_key_expiry(&key, &purpose) else {
