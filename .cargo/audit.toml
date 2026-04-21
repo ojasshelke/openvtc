@@ -1,4 +1,10 @@
-# Advisories to ignore (transitive dependencies we cannot easily update)
+# Advisories to ignore (transitive dependencies we cannot directly update)
+#
+# All entries below are in crates pulled transitively through affinidi-tdk,
+# vta-sdk, didwebvh-rs, and other third-party workspace dependencies.
+# They are not directly depended on by openvtc itself; a fix requires the
+# upstream maintainers to release new versions with updated dependency ranges.
+# Each entry is tracked and will be removed once a fix propagates.
 [advisories]
 ignore = [
     # rsa: Marvin Attack timing sidechannel — no patch available yet.
@@ -9,4 +15,24 @@ ignore = [
     # Pinned to 0.8 because aes-gcm 0.10 requires rand_core 0.6.
     # We do not use a custom logger that calls rand::rng().
     "RUSTSEC-2026-0097",
+
+    # rustls-webpki: Name constraints for URI names incorrectly accepted (CVSS 7.5).
+    # Fixed in rustls-webpki >=0.103.12.  Affects rustls 0.21.x pulled via
+    # reqwest 0.11 → ssi-dids-core → affinidi-did-resolver-cache-sdk → vta-sdk.
+    # Also affects rustls-webpki 0.103.11 via reqwest 0.13 / rustls-platform-verifier.
+    # Cannot bump without upstream affinidi/vta-sdk releasing updated crates.
+    "RUSTSEC-2026-0098",
+
+    # rustls-webpki: Wildcard name-constraint bypass (CVSS 7.5).
+    # Same dependency chain as RUSTSEC-2026-0098 above.
+    "RUSTSEC-2026-0099",
+
+    # proc-macro-error: unmaintained.
+    # Pulled via static-regular-grammar → xsd-types → ssi-caips → affinidi crates.
+    # No security impact for our use; awaiting upstream migration to proc-macro-error2.
+    "RUSTSEC-2024-0370",
+
+    # rustls-pemfile: unmaintained (both 1.x via reqwest 0.11 and 2.x via tonic).
+    # No security impact identified; purely a maintenance advisory.
+    "RUSTSEC-2025-0134",
 ]

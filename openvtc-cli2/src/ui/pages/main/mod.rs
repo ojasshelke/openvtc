@@ -76,6 +76,7 @@ impl Component for MainPage {
         }
     }
 
+    #[allow(clippy::collapsible_match)]
     fn handle_key_event(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
